@@ -381,16 +381,16 @@ npm start
 ### Docker
 ```bash
 # Build image
-docker build -t yaze-collab-server .
+docker build -t yaze-server .
 
 # Run container
-docker run -p 8765:8765 yaze-collab-server
+docker run -p 8765:8765 yaze-server
 
 # With environment variables
 docker run -p 8765:8765 \
   -e ENABLE_AI_AGENT=true \
   -e AI_AGENT_ENDPOINT=http://ai-service:5000 \
-  yaze-collab-server
+  yaze-server
 ```
 
 ### Docker Compose
@@ -417,8 +417,8 @@ heroku config:set ENABLE_AI_AGENT=true
 ### VPS / Cloud VM
 ```bash
 # Clone repository
-git clone https://github.com/scawful/yaze-collab-server
-cd yaze-collab-server
+git clone https://github.com/scawful/yaze-server
+cd yaze-server
 
 # Install dependencies
 npm install
@@ -571,7 +571,7 @@ MIT
 ## 💬 Support
 
 For issues and questions:
-- GitHub Issues: https://github.com/scawful/yaze-collab-server/issues
+- GitHub Issues: https://github.com/scawful/yaze-server/issues
 - YAZE Discord: [Join Server]
 
 ---
