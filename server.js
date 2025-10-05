@@ -289,6 +289,9 @@ async function handleMessage(ws, message) {
     case 'proposal_update':
       await handleProposalUpdate(ws, payload);
       break;
+    case 'proposal_vote':
+      await handleProposalVote(ws, payload);
+      break;
     case 'ai_query':
       await handleAIQuery(ws, payload);
       break;
@@ -683,6 +686,70 @@ async function handleProposalShare(ws, payload) {
   } catch (error) {
     console.error('Error handling proposal share:', error);
     sendError(ws, 'Failed to share proposal');
+  }
+}
+
+async function handleProposalVote(ws, payload) {
+  if (!ws.sessionId) {
+    return sendError(ws, 'Not in a session');
+  }
+  
+  const { proposal_id, approved, username } = payload;
+  
+  if (!proposal_id || approved === undefined || !username) {
+    return sendError(ws, 'proposal_id, approved, and username required');
+  }
+  
+  try {
+    // Get the proposal
+    const proposal = await getAsync(db,
+      'SELECT * FROM proposals WHERE id = ? AND session_id = ?',
+      [proposal_id, ws.sessionId]
+    );
+    
+    if (!proposal) {
+      return sendError(ws, `Proposal ${proposal_id} not found`);
+    }
+    
+    // Parse current proposal data
+    let proposalData = JSON.parse(proposal.proposal_data);
+    if (!proposalData.votes) {
+      proposalData.votes = {};
+    }
+    
+    // Record vote
+    proposalData.votes[username] = approved;
+    
+    // Update proposal with vote
+    await runAsync(db,
+      'UPDATE proposals SET proposal_data = ? WHERE id = ?',
+      [JSON.stringify(proposalData), proposal_id]
+    );
+    
+    // Get session for broadcast
+    const session = await getAsync(db,
+      'SELECT code, ai_enabled FROM sessions WHERE id = ?',
+      [ws.sessionId]
+    );
+    
+    if (session) {
+      // Broadcast vote to all participants
+      broadcast(session.code, null, {
+        type: 'proposal_vote_received',
+        payload: {
+          proposal_id,
+          username,
+          approved,
+          votes: proposalData.votes,
+          timestamp: Date.now()
+        }
+      });
+      
+      console.log(`🗳️  [${session.code}] ${username} voted ${approved ? 'approve' : 'reject'} on proposal ${proposal_id}`);
+    }
+  } catch (error) {
+    console.error('Error handling proposal vote:', error);
+    sendError(ws, 'Failed to record vote');
   }
 }
 
