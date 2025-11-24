@@ -362,6 +362,17 @@ Response:
 | `PORT` | `8765` | Server port |
 | `ENABLE_AI_AGENT` | `true` | Enable AI agent integration |
 | `AI_AGENT_ENDPOINT` | `""` | External AI agent endpoint URL |
+| `GEMINI_API_KEY` | `""` | Gemini API key (or `GOOGLE_API_KEY`) |
+| `ADMIN_API_KEY` | `""` | Protects admin endpoints |
+| `ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:5173` | Comma list of allowed HTTP/WS origins |
+| `PROTOCOL_VERSION` | `1.0.0` | Major version must match clients |
+| `WASM_TOKEN_SECRET` | `""` | HMAC secret for WASM join tokens |
+| `WASM_REQUIRE_TOKEN` | `false` | Require tokens for WASM create/join |
+| `WASM_IDLE_TIMEOUT_MS` | `60000` | Idle timeout for WASM users |
+| `WASM_HEARTBEAT_INTERVAL_MS` | `15000` | Cleanup interval for idle WASM users |
+| `WASM_STATE_PERSIST` | `false` | Persist WASM room state to disk |
+| `WASM_STATE_DIR` | `./data/wasm-state` | Directory for persisted WASM state |
+| `WASM_MAX_STATE_EVENTS` | `500` | Max state events retained per WASM room |
 
 ### Rate Limiting
 
@@ -461,6 +472,16 @@ wscat -c ws://localhost:8765
 curl http://localhost:8765/health
 curl http://localhost:8765/metrics
 ```
+
+## 🕹️ WASM Collaboration Notes
+- Clients must send `protocol_version` on `create`/`join`; the server enforces major-version match (`PROTOCOL_VERSION`).
+- Optional room password still supported; token gating is available:
+  - Configure `WASM_TOKEN_SECRET` (and `WASM_REQUIRE_TOKEN=true` to force tokens).
+  - Admin mint endpoint: `POST /admin/wasm/rooms/:code/token` (body: `{ "user_id": "alice", "expires_in": 3600 }`) with `x-admin-key`.
+  - Token format is HMAC signed and validated on create/join.
+- Idle cleanup: users inactive for `WASM_IDLE_TIMEOUT_MS` are pruned; heartbeat interval `WASM_HEARTBEAT_INTERVAL_MS`.
+- Persistence: set `WASM_STATE_PERSIST=true` to persist room state logs to `WASM_STATE_DIR` (bounded by `WASM_MAX_STATE_EVENTS`) and reload them on reconnect.
+- Admin WASM endpoints: list `GET /admin/wasm/rooms`, close `DELETE /admin/wasm/rooms/:code`, broadcast `POST /admin/wasm/rooms/:code/broadcast`.
 
 ## 📊 Database Schema
 

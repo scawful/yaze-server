@@ -17,6 +17,7 @@
 const WebSocket = require('ws');
 const initSqlJs = require('sql.js');
 const fs = require('fs');
+const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const http = require('http');
 const crypto = require('crypto');
@@ -41,6 +42,24 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY 
 const SQLITE_DB_PATH = process.env.SQLITE_DB_PATH || ':memory:';
 // Admin API key for protected endpoints
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
+// Protocol and client gating
+const PROTOCOL_VERSION = process.env.PROTOCOL_VERSION || '1.0.0';
+const PROTOCOL_MAJOR = PROTOCOL_VERSION.split('.')[0];
+// CORS / origin allowlist for HTTP + WebSocket
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:5173')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+// WASM room auth
+const WASM_TOKEN_SECRET = process.env.WASM_TOKEN_SECRET || '';
+const WASM_REQUIRE_TOKEN = process.env.WASM_REQUIRE_TOKEN === 'true';
+// WASM presence / cleanup
+const WASM_IDLE_TIMEOUT_MS = parseInt(process.env.WASM_IDLE_TIMEOUT_MS, 10) || 60000;
+const WASM_HEARTBEAT_INTERVAL_MS = parseInt(process.env.WASM_HEARTBEAT_INTERVAL_MS, 10) || 15000;
+// WASM state persistence
+const WASM_STATE_PERSIST = process.env.WASM_STATE_PERSIST === 'true';
+const WASM_STATE_DIR = process.env.WASM_STATE_DIR || path.join(__dirname, 'data', 'wasm-state');
+const WASM_MAX_STATE_EVENTS = parseInt(process.env.WASM_MAX_STATE_EVENTS, 10) || 500;
 
 // Rate limiting tracker
 const rateLimitMap = new Map(); // ip -> { count, resetTime }
@@ -188,6 +207,18 @@ const metrics = {
   totalSnapshots: 0,
   totalProposals: 0,
   totalAIQueries: 0,
+  wasmJoins: 0,
+  wasmLeaves: 0,
+  wasmHeartbeatPruned: 0,
+  protocolVersion: PROTOCOL_VERSION,
+  latencyBuckets: {
+    lt50: 0,
+    lt100: 0,
+    lt250: 0,
+    lt500: 0,
+    lt1000: 0,
+    gte1000: 0
+  },
   startTime: Date.now()
 };
 
@@ -195,8 +226,35 @@ const metrics = {
 // documented in docs/public/deployment/collaboration-server-setup.md.
 const wasmRooms = new Map(); // room_code -> { name, users: Map<user_id, {...}> }
 
+function isOriginAllowed(origin) {
+  if (!origin) return true;
+  if (ALLOWED_ORIGINS.includes('*')) return true;
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
 const app = express();
 app.use(express.json());
+
+// Basic CORS + origin enforcement
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && !isOriginAllowed(origin)) {
+    return res.status(403).json({ error: 'Origin not allowed' });
+  }
+
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-admin-key, admin_key');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
 
 // Genkit Configuration
 const ai = genkit({
@@ -231,7 +289,9 @@ app.get('/health', (req, res) => {
         uptime: Date.now() - metrics.startTime,
         sessions: sessions.size,
         wasm_rooms: wasmRooms.size,
+        wasm_users: currentWasmUserCount(),
         total_connections: wss ? wss.clients.size : 0,
+        protocol_version: PROTOCOL_VERSION,
         ai: {
           enabled: ENABLE_AI_AGENT,
           configured: !!(GEMINI_API_KEY || AI_AGENT_ENDPOINT),
@@ -245,6 +305,13 @@ app.get('/health', (req, res) => {
           type: SQLITE_DB_PATH === ':memory:' ? 'memory' : 'file',
           path: SQLITE_DB_PATH === ':memory:' ? null : SQLITE_DB_PATH
         },
+        wasm_persistence: {
+          enabled: WASM_STATE_PERSIST,
+          dir: WASM_STATE_PERSIST ? WASM_STATE_DIR : null
+        },
+        cors: {
+          allowed_origins: ALLOWED_ORIGINS
+        },
         limits: {
           rate_limit_per_min: RATE_LIMIT_MAX_MESSAGES,
           join_limit_per_min: JOIN_LIMIT_MAX_ATTEMPTS,
@@ -255,7 +322,7 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/metrics', (req, res) => {
-    res.status(200).json(metrics);
+    res.status(200).json(buildMetricsSnapshot());
 });
 
 // ---------------------------------------------------------------------------
@@ -440,6 +507,78 @@ app.post('/admin/sessions/:code/broadcast', adminAuth, (req, res) => {
   res.json({ success: true, code, recipients: count });
 });
 
+// WASM-only admin helpers
+app.get('/admin/wasm/rooms', adminAuth, (req, res) => {
+  const rooms = Array.from(wasmRooms.entries()).map(([code, room]) => ({
+    code,
+    name: room.name,
+    users: Array.from(room.users.values()).map((u) => ({
+      id: u.id,
+      name: u.name,
+      color: u.color,
+      last_activity: u.last_activity || null
+    })),
+    user_count: room.users.size,
+    password_protected: !!room.password_hash,
+    state_events: room.state_log ? room.state_log.length : 0,
+    persisted: WASM_STATE_PERSIST
+  }));
+  res.json({ rooms, total: rooms.length });
+});
+
+app.delete('/admin/wasm/rooms/:code', adminAuth, (req, res) => {
+  const code = req.params.code.toUpperCase();
+  const room = wasmRooms.get(code);
+  if (!room) {
+    return res.status(404).json({ error: `WASM room ${code} not found` });
+  }
+  room.users.forEach((user) => {
+    sendMessage(user.ws, { type: 'error', message: 'Room closed by admin', payload: { error: 'Room closed by admin' } });
+    user.ws.close();
+  });
+  wasmRooms.delete(code);
+  persistWasmState(code);
+  res.json({ success: true, code });
+});
+
+app.post('/admin/wasm/rooms/:code/broadcast', adminAuth, (req, res) => {
+  const code = req.params.code.toUpperCase();
+  const { message, message_type = 'admin' } = req.body;
+  if (!message) {
+    return res.status(400).json({ error: 'message required' });
+  }
+  const room = wasmRooms.get(code);
+  if (!room) {
+    return res.status(404).json({ error: `WASM room ${code} not found` });
+  }
+  let recipients = 0;
+  room.users.forEach((user) => {
+    sendMessage(user.ws, {
+      type: 'chat_message',
+      sender: 'ADMIN',
+      message,
+      message_type,
+      timestamp: Date.now()
+    });
+    recipients++;
+  });
+  res.json({ success: true, code, recipients });
+});
+
+app.post('/admin/wasm/rooms/:code/token', adminAuth, (req, res) => {
+  if (!WASM_TOKEN_SECRET) {
+    return res.status(400).json({ error: 'WASM_TOKEN_SECRET not configured' });
+  }
+  const code = req.params.code.toUpperCase();
+  const { user_id, expires_in = 3600 } = req.body || {};
+  if (!user_id) {
+    return res.status(400).json({ error: 'user_id required' });
+  }
+  const exp = Date.now() + Number(expires_in) * 1000;
+  const token = generateWasmToken(code, user_id, exp);
+  res.json({ token, expires_at: exp });
+});
+
 const server = http.createServer(app);
 
 // WebSocket server
@@ -448,6 +587,7 @@ const wss = new WebSocket.Server({ server });
 // Start server after database initialization
 async function startServer() {
   await initDatabase();
+  ensureWasmStateDir();
 
   server.listen(PORT, () => {
     console.log(`🚀 YAZE Collaboration Server v2.0 listening on port ${PORT}`);
@@ -464,6 +604,11 @@ startServer().catch(err => {
 });
 
 wss.on('connection', (ws, req) => {
+  const origin = req.headers.origin;
+  if (origin && !isOriginAllowed(origin)) {
+    ws.close(1008, 'Origin not allowed');
+    return;
+  }
   const clientIp = req.socket.remoteAddress;
   console.log(`📡 New client connected from ${clientIp}`);
   
@@ -473,8 +618,10 @@ wss.on('connection', (ws, req) => {
   ws.clientIp = clientIp;
   ws.messageCount = 0;
   ws.lastMessageTime = Date.now();
+  ws.lastActivity = Date.now();
   ws.wasmRoom = null;
   ws.wasmUserId = null;
+  ws.protocolVersion = null;
   
   ws.on('pong', () => {
     ws.isAlive = true;
@@ -482,6 +629,7 @@ wss.on('connection', (ws, req) => {
   
   ws.on('message', async (data) => {
     try {
+      const start = Date.now();
       // Rate limiting check
       if (!checkRateLimit(ws)) {
         sendError(ws, 'Rate limit exceeded. Please slow down.');
@@ -490,9 +638,12 @@ wss.on('connection', (ws, req) => {
       
       const message = JSON.parse(data.toString());
       await handleMessage(ws, message);
+      recordLatency(Date.now() - start);
       
       ws.messageCount++;
       ws.lastMessageTime = Date.now();
+      ws.lastActivity = ws.lastMessageTime;
+      touchWasmUser(ws);
     } catch (error) {
       console.error('Error handling message:', error);
       sendError(ws, 'Invalid message format');
@@ -520,8 +671,11 @@ const heartbeat = setInterval(() => {
   });
 }, 30000);
 
+const wasmHeartbeat = setInterval(cleanupWasmRooms, WASM_HEARTBEAT_INTERVAL_MS);
+
 wss.on('close', () => {
   clearInterval(heartbeat);
+  clearInterval(wasmHeartbeat);
 });
 
 // Rate limiting
@@ -1300,6 +1454,155 @@ function generateHash(data) {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
 
+function recordLatency(durationMs) {
+  if (durationMs < 50) metrics.latencyBuckets.lt50++;
+  else if (durationMs < 100) metrics.latencyBuckets.lt100++;
+  else if (durationMs < 250) metrics.latencyBuckets.lt250++;
+  else if (durationMs < 500) metrics.latencyBuckets.lt500++;
+  else if (durationMs < 1000) metrics.latencyBuckets.lt1000++;
+  else metrics.latencyBuckets.gte1000++;
+}
+
+function currentWasmUserCount() {
+  let count = 0;
+  wasmRooms.forEach((room) => (count += room.users.size));
+  return count;
+}
+
+function buildMetricsSnapshot() {
+  return {
+    ...metrics,
+    wasmRooms: wasmRooms.size,
+    wasmUsers: currentWasmUserCount()
+  };
+}
+
+function checkProtocolVersion(ws, clientVersion) {
+  if (!clientVersion) {
+    sendWasmError(ws, 'protocol_version required');
+    return false;
+  }
+  const major = clientVersion.split('.')[0];
+  if (major !== PROTOCOL_MAJOR) {
+    sendWasmError(ws, `protocol_version mismatch (server ${PROTOCOL_VERSION}, client ${clientVersion})`);
+    return false;
+  }
+  return true;
+}
+
+function validateWasmToken(room, userId, token) {
+  if (!WASM_TOKEN_SECRET) {
+    return true;
+  }
+  if (!token) {
+    return !WASM_REQUIRE_TOKEN;
+  }
+  const parts = token.split('|');
+  if (parts.length !== 4) return false;
+  const [tokenRoom, tokenUser, expStr, sig] = parts;
+  if (tokenRoom !== room || tokenUser !== userId) return false;
+  const exp = parseInt(expStr, 10);
+  if (!Number.isFinite(exp) || exp < Date.now()) return false;
+  const payload = `${tokenRoom}|${tokenUser}|${exp}`;
+  const expected = crypto.createHmac('sha256', WASM_TOKEN_SECRET).update(payload).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(sig, 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
+function generateWasmToken(room, userId, expiresAtMs) {
+  const payload = `${room}|${userId}|${expiresAtMs}`;
+  const sig = crypto.createHmac('sha256', WASM_TOKEN_SECRET).update(payload).digest('hex');
+  return `${payload}|${sig}`;
+}
+
+function ensureWasmStateDir() {
+  if (!WASM_STATE_PERSIST) return;
+  if (!fs.existsSync(WASM_STATE_DIR)) {
+    fs.mkdirSync(WASM_STATE_DIR, { recursive: true });
+  }
+}
+
+function loadPersistedWasmState(roomCode) {
+  if (!WASM_STATE_PERSIST) return null;
+  ensureWasmStateDir();
+  const filePath = path.join(WASM_STATE_DIR, `${roomCode}.json`);
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function persistWasmState(roomCode) {
+  if (!WASM_STATE_PERSIST) return;
+  ensureWasmStateDir();
+  const room = wasmRooms.get(roomCode);
+  if (!room) return;
+  const filePath = path.join(WASM_STATE_DIR, `${roomCode}.json`);
+  const payload = {
+    name: room.name,
+    password_hash: room.password_hash || null,
+    state_log: room.state_log || []
+  };
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+  } catch (err) {
+    console.error(`Failed to persist WASM state for ${roomCode}:`, err);
+  }
+}
+
+function recordWasmState(roomCode, event) {
+  const room = wasmRooms.get(roomCode);
+  if (!room) return;
+  room.state_log = room.state_log || [];
+  room.state_log.push({ ...event, recorded_at: Date.now() });
+  if (room.state_log.length > WASM_MAX_STATE_EVENTS) {
+    room.state_log = room.state_log.slice(-WASM_MAX_STATE_EVENTS);
+  }
+  persistWasmState(roomCode);
+}
+
+function touchWasmUser(ws) {
+  if (!ws.wasmRoom || !ws.wasmUserId) return;
+  const room = wasmRooms.get(ws.wasmRoom);
+  if (!room) return;
+  const user = room.users.get(ws.wasmUserId);
+  if (!user) return;
+  user.last_activity = Date.now();
+}
+
+function cleanupWasmRooms() {
+  const now = Date.now();
+  wasmRooms.forEach((room, code) => {
+    let removed = false;
+    room.users.forEach((user, userId) => {
+      const last = user.last_activity || 0;
+      if (now - last > WASM_IDLE_TIMEOUT_MS) {
+        metrics.wasmHeartbeatPruned++;
+        metrics.wasmLeaves++;
+        if (user.ws && user.ws.readyState === WebSocket.OPEN) {
+          sendMessage(user.ws, { type: 'error', message: 'Idle timeout', payload: { error: 'Idle timeout' } });
+          user.ws.close();
+        }
+        room.users.delete(userId);
+        removed = true;
+      }
+    });
+    if (room.users.size === 0) {
+      persistWasmState(code);
+      wasmRooms.delete(code);
+      return;
+    }
+    if (removed) {
+      broadcastWasmUserList(code);
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------
 // WASM collaboration protocol support
 // ---------------------------------------------------------------------------
@@ -1320,28 +1623,36 @@ function broadcastWasmUserList(roomCode) {
     id: user.id,
     name: user.name,
     color: user.color,
-    active: true
+    active: true,
+    last_activity: user.last_activity || null
   }));
   broadcastWasm(roomCode, { type: 'users', list });
 }
 
 async function handleWasmCreate(ws, msg) {
-  const { room, name, user, user_id, color, password } = msg;
+  const { room, name, user, user_id, color, password, protocol_version, token } = msg;
   if (!room || !user || !user_id) {
     return sendWasmError(ws, 'room, user, and user_id are required');
+  }
+  if (!checkProtocolVersion(ws, protocol_version)) return;
+  if (!validateWasmToken(room, user_id, token)) {
+    return sendWasmError(ws, 'Invalid join token');
   }
   if (wasmRooms.has(room)) {
     return sendWasmError(ws, `Room ${room} already exists`);
   }
 
-  const sessionName = name || 'YAZE Session';
+  const persisted = loadPersistedWasmState(room);
+  const sessionName = name || persisted?.name || 'YAZE Session';
   const userColor = color || '#4ECDC4';
-  const now = Date.now() / 1000;
-  const passwordHash = password ? generateHash(password) : null;
+  const now = Date.now();
+  const passwordHash = password ? generateHash(password) : (persisted?.password_hash || null);
+  const stateLog = (persisted?.state_log || []).slice(-WASM_MAX_STATE_EVENTS);
 
   wasmRooms.set(room, {
     name: sessionName,
     password_hash: passwordHash,
+    state_log: stateLog,
     users: new Map([
       [
         user_id,
@@ -1352,19 +1663,35 @@ async function handleWasmCreate(ws, msg) {
 
   ws.wasmRoom = room;
   ws.wasmUserId = user_id;
+  ws.protocolVersion = protocol_version;
+  metrics.wasmJoins++;
+  persistWasmState(room);
 
-  sendMessage(ws, { type: 'create_response', success: true, session_name: sessionName });
+  sendMessage(ws, { type: 'create_response', success: true, session_name: sessionName, protocol_version: PROTOCOL_VERSION, state_log: stateLog });
   broadcastWasmUserList(room);
 }
 
 async function handleWasmJoin(ws, msg) {
-  const { room, user, user_id, color, password } = msg;
+  const { room, user, user_id, color, password, protocol_version, token } = msg;
   if (!room || !user || !user_id) {
     return sendWasmError(ws, 'room, user, and user_id are required');
   }
-  const roomEntry = wasmRooms.get(room);
+  if (!checkProtocolVersion(ws, protocol_version)) return;
+
+  let roomEntry = wasmRooms.get(room);
   if (!roomEntry) {
-    return sendWasmError(ws, `Room ${room} not found`);
+    const persisted = loadPersistedWasmState(room);
+    if (persisted) {
+      roomEntry = {
+        name: persisted.name || 'YAZE Session',
+        password_hash: persisted.password_hash || null,
+        state_log: (persisted.state_log || []).slice(-WASM_MAX_STATE_EVENTS),
+        users: new Map()
+      };
+      wasmRooms.set(room, roomEntry);
+    } else {
+      return sendWasmError(ws, `Room ${room} not found`);
+    }
   }
 
   if (roomEntry.password_hash) {
@@ -1374,7 +1701,11 @@ async function handleWasmJoin(ws, msg) {
     }
   }
 
-  const now = Date.now() / 1000;
+  if (!validateWasmToken(room, user_id, token)) {
+    return sendWasmError(ws, 'Invalid join token');
+  }
+
+  const now = Date.now();
   const existing = roomEntry.users.get(user_id);
   const userColor = color || (existing ? existing.color : '#4ECDC4');
 
@@ -1388,8 +1719,17 @@ async function handleWasmJoin(ws, msg) {
 
   ws.wasmRoom = room;
   ws.wasmUserId = user_id;
+  ws.protocolVersion = protocol_version;
+  metrics.wasmJoins++;
+  persistWasmState(room);
 
-  sendMessage(ws, { type: 'join_response', success: true, session_name: roomEntry.name });
+  sendMessage(ws, {
+    type: 'join_response',
+    success: true,
+    session_name: roomEntry.name,
+    protocol_version: PROTOCOL_VERSION,
+    state_log: roomEntry.state_log || []
+  });
   broadcastWasmUserList(room);
 }
 
@@ -1405,6 +1745,7 @@ function handleWasmChange(ws, msg) {
   if (!wasmRooms.has(room)) {
     return sendWasmError(ws, `Room ${room} not found`);
   }
+  const ts = timestamp || Date.now();
   broadcastWasm(
     room,
     {
@@ -1414,10 +1755,12 @@ function handleWasmChange(ws, msg) {
       offset,
       old_data,
       new_data,
-      timestamp: timestamp || Date.now() / 1000
+      timestamp: ts
     },
     ws
   );
+  touchWasmUser(ws);
+  recordWasmState(room, { type: 'change', user_id, offset, old_data, new_data, timestamp: ts });
 }
 
 function handleWasmCursor(ws, msg) {
@@ -1441,6 +1784,7 @@ function handleWasmCursor(ws, msg) {
     },
     ws
   );
+  touchWasmUser(ws);
 }
 
 function removeWasmParticipant(ws) {
@@ -1448,10 +1792,13 @@ function removeWasmParticipant(ws) {
   const roomEntry = wasmRooms.get(ws.wasmRoom);
   if (roomEntry) {
     roomEntry.users.delete(ws.wasmUserId);
+    metrics.wasmLeaves++;
     if (roomEntry.users.size === 0) {
+      persistWasmState(ws.wasmRoom);
       wasmRooms.delete(ws.wasmRoom);
     } else {
       broadcastWasmUserList(ws.wasmRoom);
+      persistWasmState(ws.wasmRoom);
     }
   }
   ws.wasmRoom = null;
