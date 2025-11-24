@@ -19,26 +19,40 @@ const sqlite3 = require('sqlite3').verbose();
 const { v4: uuidv4 } = require('uuid');
 const http = require('http');
 const crypto = require('crypto');
+const express = require('express');
+const { genkit, z } = require('genkit');
+const { googleAI } = require('@genkit-ai/google-genai');
+const { expressHandler } = require('@genkit-ai/express');
+
 
 // Configuration
 const PORT = process.env.PORT || 8765;
 const MAX_SNAPSHOT_SIZE = 10 * 1024 * 1024; // 10MB
 const MAX_ROM_DIFF_SIZE = 5 * 1024 * 1024; // 5MB
 const RATE_LIMIT_WINDOW = 60000; // 1 minute
-const RATE_LIMIT_MAX_MESSAGES = 100;
+const RATE_LIMIT_MAX_MESSAGES = parseInt(process.env.RATE_LIMIT_MAX_MESSAGES) || 100;
+const JOIN_LIMIT_WINDOW = 60000; // 1 minute
+const JOIN_LIMIT_MAX_ATTEMPTS = parseInt(process.env.JOIN_LIMIT_MAX_ATTEMPTS) || 10;
 const ENABLE_AI_AGENT = process.env.ENABLE_AI_AGENT !== 'false';
 const AI_AGENT_ENDPOINT = process.env.AI_AGENT_ENDPOINT || '';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+// Persistence configuration
+const SQLITE_DB_PATH = process.env.SQLITE_DB_PATH || ':memory:';
+// Admin API key for protected endpoints
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
 
 // Rate limiting tracker
 const rateLimitMap = new Map(); // ip -> { count, resetTime }
+const joinLimitMap = new Map(); // ip -> { count, resetTime }
 
 // Database setup
-const db = new sqlite3.Database(':memory:', (err) => {
+const db = new sqlite3.Database(SQLITE_DB_PATH, (err) => {
   if (err) {
     console.error('Database connection failed:', err);
     process.exit(1);
   }
-  console.log('✓ Connected to in-memory SQLite database');
+  const dbType = SQLITE_DB_PATH === ':memory:' ? 'in-memory' : `file (${SQLITE_DB_PATH})`;
+  console.log(`✓ Connected to ${dbType} SQLite database`);
 });
 
 // Initialize database schema
@@ -51,7 +65,8 @@ db.serialize(() => {
       host TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       rom_hash TEXT,
-      ai_enabled INTEGER DEFAULT 1
+      ai_enabled INTEGER DEFAULT 1,
+      password_hash TEXT
     )
   `);
   
@@ -143,35 +158,266 @@ const metrics = {
   startTime: Date.now()
 };
 
+// Lightweight rooms for WASM clients using the simple collaboration protocol
+// documented in docs/public/deployment/collaboration-server-setup.md.
+const wasmRooms = new Map(); // room_code -> { name, users: Map<user_id, {...}> }
+
+const app = express();
+app.use(express.json());
+
+// Genkit Configuration
+const ai = genkit({
+    plugins: [googleAI()],
+    logLevel: "debug",
+    enableTracingAndMetrics: true,
+});
+
+const yazeHelloFlow = ai.defineFlow(
+    {
+        name: 'yazeHello',
+        inputSchema: z.string(),
+        outputSchema: z.string(),
+    },
+    async (name) => {
+        return `Hello, ${name}! This is a Genkit flow running in yaze-server.`;
+    }
+);
+
+app.post('/yazeHello', expressHandler(yazeHelloFlow));
+
+
 // Create HTTP server for health checks
-const server = http.createServer((req, res) => {
-  const url = req.url;
-  
-  if (url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'healthy',
-      uptime: Date.now() - metrics.startTime,
-      sessions: sessions.size,
-      metrics
+app.get('/health', (req, res) => {
+    // Detect if request came through TLS proxy (X-Forwarded-Proto header)
+    const tlsEnabled = req.headers['x-forwarded-proto'] === 'https' ||
+                       req.secure ||
+                       req.headers['x-forwarded-ssl'] === 'on';
+    res.status(200).json({
+        status: 'healthy',
+        version: '2.1',
+        uptime: Date.now() - metrics.startTime,
+        sessions: sessions.size,
+        wasm_rooms: wasmRooms.size,
+        total_connections: wss ? wss.clients.size : 0,
+        ai: {
+          enabled: ENABLE_AI_AGENT,
+          configured: !!(GEMINI_API_KEY || AI_AGENT_ENDPOINT),
+          provider: GEMINI_API_KEY ? 'gemini' : (AI_AGENT_ENDPOINT ? 'external' : 'none')
+        },
+        tls: {
+          detected: tlsEnabled,
+          note: tlsEnabled ? 'Request via TLS proxy' : 'Plain HTTP (consider TLS proxy)'
+        },
+        persistence: {
+          type: SQLITE_DB_PATH === ':memory:' ? 'memory' : 'file',
+          path: SQLITE_DB_PATH === ':memory:' ? null : SQLITE_DB_PATH
+        },
+        limits: {
+          rate_limit_per_min: RATE_LIMIT_MAX_MESSAGES,
+          join_limit_per_min: JOIN_LIMIT_MAX_ATTEMPTS,
+          max_rom_diff_mb: MAX_ROM_DIFF_SIZE / (1024 * 1024),
+          max_snapshot_mb: MAX_SNAPSHOT_SIZE / (1024 * 1024)
+        }
+    });
+});
+
+app.get('/metrics', (req, res) => {
+    res.status(200).json(metrics);
+});
+
+// ---------------------------------------------------------------------------
+// Admin endpoints (require ADMIN_API_KEY if set)
+// ---------------------------------------------------------------------------
+function adminAuth(req, res, next) {
+  if (!ADMIN_API_KEY) {
+    return next(); // No auth required if not configured
+  }
+  const providedKey = req.headers['x-admin-key'] || req.query.admin_key;
+  if (providedKey !== ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// List all active sessions/rooms
+app.get('/admin/sessions', adminAuth, async (req, res) => {
+  try {
+    const dbSessions = await allAsync(db,
+      'SELECT id, code, name, host, created_at, ai_enabled FROM sessions ORDER BY created_at DESC',
+      []
+    );
+    const wasmRoomList = Array.from(wasmRooms.entries()).map(([code, room]) => ({
+      code,
+      name: room.name,
+      user_count: room.users.size,
+      type: 'wasm'
     }));
-  } else if (url === '/metrics') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(metrics));
-  } else {
-    res.writeHead(404);
-    res.end('Not Found');
+    res.json({
+      sessions: dbSessions.map(s => ({
+        ...s,
+        active_connections: sessions.get(s.code)?.size || 0,
+        type: 'full'
+      })),
+      wasm_rooms: wasmRoomList,
+      total_connections: wss.clients.size
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
+
+// List users in a specific session/room
+app.get('/admin/sessions/:code/users', adminAuth, async (req, res) => {
+  const code = req.params.code.toUpperCase();
+  try {
+    // Check full sessions first
+    const session = await getAsync(db, 'SELECT id FROM sessions WHERE code = ?', [code]);
+    if (session) {
+      const participants = await allAsync(db,
+        'SELECT username, joined_at, last_seen FROM participants WHERE session_id = ?',
+        [session.id]
+      );
+      return res.json({ code, type: 'full', users: participants });
+    }
+    // Check WASM rooms
+    const wasmRoom = wasmRooms.get(code);
+    if (wasmRoom) {
+      const users = Array.from(wasmRoom.users.values()).map(u => ({
+        id: u.id,
+        name: u.name,
+        color: u.color
+      }));
+      return res.json({ code, type: 'wasm', users });
+    }
+    res.status(404).json({ error: `Session ${code} not found` });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Close a session/room (kick all users)
+app.delete('/admin/sessions/:code', adminAuth, async (req, res) => {
+  const code = req.params.code.toUpperCase();
+  const reason = req.body?.reason || 'Session closed by administrator';
+  try {
+    // Close full session
+    const sessionSet = sessions.get(code);
+    if (sessionSet) {
+      sessionSet.forEach((ws) => {
+        sendMessage(ws, { type: 'error', payload: { error: reason } });
+        ws.close();
+      });
+      sessions.delete(code);
+      await runAsync(db, 'DELETE FROM participants WHERE session_id IN (SELECT id FROM sessions WHERE code = ?)', [code]);
+      await runAsync(db, 'DELETE FROM sessions WHERE code = ?', [code]);
+    }
+    // Close WASM room
+    const wasmRoom = wasmRooms.get(code);
+    if (wasmRoom) {
+      wasmRoom.users.forEach((user) => {
+        sendMessage(user.ws, { type: 'error', message: reason, payload: { error: reason } });
+        user.ws.close();
+      });
+      wasmRooms.delete(code);
+    }
+    if (!sessionSet && !wasmRoom) {
+      return res.status(404).json({ error: `Session ${code} not found` });
+    }
+    console.log(`🔒 Admin closed session ${code}: ${reason}`);
+    res.json({ success: true, code, reason });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Kick a specific user from a session
+app.delete('/admin/sessions/:code/users/:userId', adminAuth, async (req, res) => {
+  const code = req.params.code.toUpperCase();
+  const userId = req.params.userId;
+  const reason = req.body?.reason || 'Kicked by administrator';
+  try {
+    // Full session
+    const sessionSet = sessions.get(code);
+    if (sessionSet) {
+      for (const ws of sessionSet) {
+        if (ws.username === userId) {
+          sendMessage(ws, { type: 'error', payload: { error: reason } });
+          ws.close();
+          console.log(`🔒 Admin kicked ${userId} from ${code}: ${reason}`);
+          return res.json({ success: true, code, userId, reason });
+        }
+      }
+    }
+    // WASM room
+    const wasmRoom = wasmRooms.get(code);
+    if (wasmRoom) {
+      const user = wasmRoom.users.get(userId);
+      if (user) {
+        sendMessage(user.ws, { type: 'error', message: reason, payload: { error: reason } });
+        user.ws.close();
+        wasmRoom.users.delete(userId);
+        broadcastWasmUserList(code);
+        console.log(`🔒 Admin kicked ${userId} from ${code}: ${reason}`);
+        return res.json({ success: true, code, userId, reason });
+      }
+    }
+    res.status(404).json({ error: `User ${userId} not found in session ${code}` });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Broadcast message to all users in a session
+app.post('/admin/sessions/:code/broadcast', adminAuth, (req, res) => {
+  const code = req.params.code.toUpperCase();
+  const { message, message_type = 'admin' } = req.body;
+  if (!message) {
+    return res.status(400).json({ error: 'message required' });
+  }
+  let count = 0;
+  // Full session
+  const sessionSet = sessions.get(code);
+  if (sessionSet) {
+    sessionSet.forEach((ws) => {
+      sendMessage(ws, {
+        type: 'chat_message',
+        payload: { sender: 'ADMIN', message, message_type, timestamp: Date.now() }
+      });
+      count++;
+    });
+  }
+  // WASM room
+  const wasmRoom = wasmRooms.get(code);
+  if (wasmRoom) {
+    wasmRoom.users.forEach((user) => {
+      sendMessage(user.ws, {
+        type: 'chat_message',
+        sender: 'ADMIN',
+        message,
+        message_type,
+        timestamp: Date.now()
+      });
+      count++;
+    });
+  }
+  if (count === 0) {
+    return res.status(404).json({ error: `Session ${code} not found or empty` });
+  }
+  console.log(`📢 Admin broadcast to ${code}: ${message}`);
+  res.json({ success: true, code, recipients: count });
+});
+
+const server = http.createServer(app);
 
 // WebSocket server
 const wss = new WebSocket.Server({ server });
 
 server.listen(PORT, () => {
-  console.log(`🚀 YAZE Collaboration Server v2.0 listening on port ${PORT}`);
-  console.log(`   HTTP Health Check: http://localhost:${PORT}/health`);
-  console.log(`   WebSocket: ws://localhost:${PORT}`);
-  console.log(`   AI Agent: ${ENABLE_AI_AGENT ? 'Enabled' : 'Disabled'}`);
+    console.log(`🚀 YAZE Collaboration Server v2.0 listening on port ${PORT}`);
+    console.log(`   HTTP Health Check: http://localhost:${PORT}/health`);
+    console.log(`   WebSocket: ws://localhost:${PORT}`);
+    console.log(`   Genkit Flow: POST http://localhost:${PORT}/yazeHello`);
+    console.log(`   AI Agent: ${ENABLE_AI_AGENT ? 'Enabled' : 'Disabled'}`);
 });
 
 wss.on('connection', (ws, req) => {
@@ -184,6 +430,8 @@ wss.on('connection', (ws, req) => {
   ws.clientIp = clientIp;
   ws.messageCount = 0;
   ws.lastMessageTime = Date.now();
+  ws.wasmRoom = null;
+  ws.wasmUserId = null;
   
   ws.on('pong', () => {
     ws.isAlive = true;
@@ -258,6 +506,30 @@ function checkRateLimit(ws) {
   return true;
 }
 
+function checkJoinRateLimit(ws) {
+  const now = Date.now();
+  const key = ws.clientIp;
+
+  if (!joinLimitMap.has(key)) {
+    joinLimitMap.set(key, { count: 1, resetTime: now + JOIN_LIMIT_WINDOW });
+    return true;
+  }
+
+  const limit = joinLimitMap.get(key);
+  if (now > limit.resetTime) {
+    limit.count = 1;
+    limit.resetTime = now + JOIN_LIMIT_WINDOW;
+    return true;
+  }
+
+  if (limit.count >= JOIN_LIMIT_MAX_ATTEMPTS) {
+    return false;
+  }
+
+  limit.count++;
+  return true;
+}
+
 // Message handlers
 async function handleMessage(ws, message) {
   const { type, payload } = message;
@@ -295,6 +567,21 @@ async function handleMessage(ws, message) {
     case 'ai_query':
       await handleAIQuery(ws, payload);
       break;
+    case 'create':  // WASM protocol: create a session with provided code
+      await handleWasmCreate(ws, message);
+      break;
+    case 'join':  // WASM protocol: join existing session by code
+      await handleWasmJoin(ws, message);
+      break;
+    case 'leave':  // WASM protocol: leave current session
+      handleWasmLeave(ws);
+      break;
+    case 'change':  // WASM protocol: ROM byte-range patch
+      handleWasmChange(ws, message);
+      break;
+    case 'cursor':  // WASM protocol: cursor/presence update
+      handleWasmCursor(ws, message);
+      break;
     case 'ping':
       sendMessage(ws, { type: 'pong', payload: { timestamp: Date.now() } });
       break;
@@ -304,20 +591,25 @@ async function handleMessage(ws, message) {
 }
 
 async function handleHostSession(ws, payload) {
-  const { session_name, username, rom_hash = null, ai_enabled = true } = payload;
+  const { session_name, username, rom_hash = null, ai_enabled = true, session_password = null } = payload;
   
   if (!session_name || !username) {
     return sendError(ws, 'session_name and username required');
+  }
+
+  if (!checkJoinRateLimit(ws)) {
+    return sendError(ws, 'Too many host attempts. Please wait a moment.');
   }
   
   const sessionId = uuidv4();
   const sessionCode = generateSessionCode();
   const now = Date.now();
+  const passwordHash = session_password ? generateHash(session_password) : null;
   
   try {
     await runAsync(db, 
-      'INSERT INTO sessions (id, code, name, host, created_at, rom_hash, ai_enabled) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [sessionId, sessionCode, session_name, username, now, rom_hash, ai_enabled ? 1 : 0]
+      'INSERT INTO sessions (id, code, name, host, created_at, rom_hash, ai_enabled, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [sessionId, sessionCode, session_name, username, now, rom_hash, ai_enabled ? 1 : 0, passwordHash]
     );
     
     await runAsync(db,
@@ -343,7 +635,8 @@ async function handleHostSession(ws, payload) {
         session_name: session_name,
         participants: [username],
         rom_hash,
-        ai_enabled
+        ai_enabled,
+        password_protected: !!passwordHash
       }
     });
     
@@ -355,10 +648,14 @@ async function handleHostSession(ws, payload) {
 }
 
 async function handleJoinSession(ws, payload) {
-  const { session_code, username } = payload;
+  const { session_code, username, session_password = null } = payload;
   
   if (!session_code || !username) {
     return sendError(ws, 'session_code and username required');
+  }
+
+  if (!checkJoinRateLimit(ws)) {
+    return sendError(ws, 'Too many join attempts. Please wait a moment.');
   }
   
   try {
@@ -369,6 +666,14 @@ async function handleJoinSession(ws, payload) {
     
     if (!session) {
       return sendError(ws, `Session ${session_code} not found`);
+    }
+
+    // Password check if required
+    if (session.password_hash) {
+      const providedHash = session_password ? generateHash(session_password) : null;
+      if (!providedHash || providedHash !== session.password_hash) {
+        return sendError(ws, 'Invalid session password');
+      }
     }
     
     // Check if user already in session
@@ -821,6 +1126,9 @@ async function handleAIQuery(ws, payload) {
     if (!ENABLE_AI_AGENT) {
       return sendError(ws, 'AI agent not configured on server');
     }
+    if (!GEMINI_API_KEY && !AI_AGENT_ENDPOINT) {
+      return sendError(ws, 'AI agent key/endpoint not configured');
+    }
     
     // Store interaction
     await runAsync(db,
@@ -830,18 +1138,47 @@ async function handleAIQuery(ws, payload) {
     
     metrics.totalAIQueries++;
     
-    // In a real implementation, this would call an AI service
-    // For now, send a placeholder response
-    const aiResponse = {
-      query_id: queryId,
-      response: 'AI agent endpoint not configured. Set AI_AGENT_ENDPOINT environment variable.',
-      timestamp: Date.now()
-    };
+    let responseText = 'AI agent not available';
+
+    if (AI_AGENT_ENDPOINT) {
+      // Proxy mode: send to external agent endpoint
+      try {
+        const res = await fetch(AI_AGENT_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, username, session: session.code })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        responseText = data.response || JSON.stringify(data);
+      } catch (e) {
+        responseText = `AI agent error: ${e.message}`;
+      }
+    } else if (GEMINI_API_KEY) {
+      // Direct Gemini call
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: query }]}]
+          })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const candidate = data?.candidates?.[0];
+        const part = candidate?.content?.parts?.[0];
+        responseText = part?.text || 'No response from Gemini';
+      } catch (e) {
+        responseText = `Gemini error: ${e.message}`;
+      }
+    }
     
     // Update interaction with response
     await runAsync(db,
       'UPDATE agent_interactions SET response = ? WHERE id = ?',
-      [aiResponse.response, queryId]
+      [responseText, queryId]
     );
     
     // Broadcast AI response to all participants
@@ -851,8 +1188,8 @@ async function handleAIQuery(ws, payload) {
         query_id: queryId,
         username,
         query,
-        response: aiResponse.response,
-        timestamp: aiResponse.timestamp
+        response: responseText,
+        timestamp: Date.now()
       }
     });
     
@@ -866,6 +1203,9 @@ async function handleAIQuery(ws, payload) {
 function handleDisconnect(ws) {
   if (ws.sessionId) {
     handleLeaveSession(ws);
+  }
+  if (ws.wasmRoom && ws.wasmUserId) {
+    removeWasmParticipant(ws);
   }
   console.log(`📡 Client disconnected (${ws.clientIp})`);
 }
@@ -891,6 +1231,11 @@ function sendError(ws, error) {
   sendMessage(ws, { type: 'error', payload: { error } });
 }
 
+function sendWasmError(ws, error) {
+  // Send both legacy payload and direct message for compatibility
+  sendMessage(ws, { type: 'error', message: error, payload: { error } });
+}
+
 function broadcast(sessionCode, exclude, message) {
   const sessionSet = sessions.get(sessionCode);
   if (!sessionSet) return;
@@ -910,6 +1255,164 @@ function logMessage(direction, type, user, payload) {
 
 function generateHash(data) {
   return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+// ---------------------------------------------------------------------------
+// WASM collaboration protocol support
+// ---------------------------------------------------------------------------
+function broadcastWasm(roomCode, message, exclude) {
+  const room = wasmRooms.get(roomCode);
+  if (!room) return;
+  room.users.forEach((user) => {
+    if (user.ws !== exclude && user.ws.readyState === WebSocket.OPEN) {
+      sendMessage(user.ws, message);
+    }
+  });
+}
+
+function broadcastWasmUserList(roomCode) {
+  const room = wasmRooms.get(roomCode);
+  if (!room) return;
+  const list = Array.from(room.users.values()).map((user) => ({
+    id: user.id,
+    name: user.name,
+    color: user.color,
+    active: true
+  }));
+  broadcastWasm(roomCode, { type: 'users', list });
+}
+
+async function handleWasmCreate(ws, msg) {
+  const { room, name, user, user_id, color, password } = msg;
+  if (!room || !user || !user_id) {
+    return sendWasmError(ws, 'room, user, and user_id are required');
+  }
+  if (wasmRooms.has(room)) {
+    return sendWasmError(ws, `Room ${room} already exists`);
+  }
+
+  const sessionName = name || 'YAZE Session';
+  const userColor = color || '#4ECDC4';
+  const now = Date.now() / 1000;
+  const passwordHash = password ? generateHash(password) : null;
+
+  wasmRooms.set(room, {
+    name: sessionName,
+    password_hash: passwordHash,
+    users: new Map([
+      [
+        user_id,
+        { id: user_id, name: user, color: userColor, last_activity: now, ws }
+      ]
+    ])
+  });
+
+  ws.wasmRoom = room;
+  ws.wasmUserId = user_id;
+
+  sendMessage(ws, { type: 'create_response', success: true, session_name: sessionName });
+  broadcastWasmUserList(room);
+}
+
+async function handleWasmJoin(ws, msg) {
+  const { room, user, user_id, color, password } = msg;
+  if (!room || !user || !user_id) {
+    return sendWasmError(ws, 'room, user, and user_id are required');
+  }
+  const roomEntry = wasmRooms.get(room);
+  if (!roomEntry) {
+    return sendWasmError(ws, `Room ${room} not found`);
+  }
+
+  if (roomEntry.password_hash) {
+    const providedHash = password ? generateHash(password) : null;
+    if (!providedHash || providedHash !== roomEntry.password_hash) {
+      return sendWasmError(ws, 'Invalid session password');
+    }
+  }
+
+  const now = Date.now() / 1000;
+  const existing = roomEntry.users.get(user_id);
+  const userColor = color || (existing ? existing.color : '#4ECDC4');
+
+  roomEntry.users.set(user_id, {
+    id: user_id,
+    name: user,
+    color: userColor,
+    last_activity: now,
+    ws
+  });
+
+  ws.wasmRoom = room;
+  ws.wasmUserId = user_id;
+
+  sendMessage(ws, { type: 'join_response', success: true, session_name: roomEntry.name });
+  broadcastWasmUserList(room);
+}
+
+function handleWasmLeave(ws) {
+  removeWasmParticipant(ws);
+}
+
+function handleWasmChange(ws, msg) {
+  const { room, user_id, offset, old_data, new_data, timestamp } = msg;
+  if (!room || !user_id) {
+    return sendWasmError(ws, 'room and user_id are required for change');
+  }
+  if (!wasmRooms.has(room)) {
+    return sendWasmError(ws, `Room ${room} not found`);
+  }
+  broadcastWasm(
+    room,
+    {
+      type: 'change',
+      room,
+      user_id,
+      offset,
+      old_data,
+      new_data,
+      timestamp: timestamp || Date.now() / 1000
+    },
+    ws
+  );
+}
+
+function handleWasmCursor(ws, msg) {
+  const { room, user_id, editor, x, y, map_id } = msg;
+  if (!room || !user_id) {
+    return sendWasmError(ws, 'room and user_id are required for cursor');
+  }
+  if (!wasmRooms.has(room)) {
+    return sendWasmError(ws, `Room ${room} not found`);
+  }
+  broadcastWasm(
+    room,
+    {
+      type: 'cursor',
+      room,
+      user_id,
+      editor,
+      x,
+      y,
+      map_id
+    },
+    ws
+  );
+}
+
+function removeWasmParticipant(ws) {
+  if (!ws.wasmRoom || !ws.wasmUserId) return;
+  const roomEntry = wasmRooms.get(ws.wasmRoom);
+  if (roomEntry) {
+    roomEntry.users.delete(ws.wasmUserId);
+    if (roomEntry.users.size === 0) {
+      wasmRooms.delete(ws.wasmRoom);
+    } else {
+      broadcastWasmUserList(ws.wasmRoom);
+    }
+  }
+  ws.wasmRoom = null;
+  ws.wasmUserId = null;
 }
 
 // Promisify database methods
