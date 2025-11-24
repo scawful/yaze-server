@@ -36,7 +36,7 @@
     "@genkit-ai/express": "^1.21.0",
     "@genkit-ai/google-genai": "^1.21.0",
     "genkit": "^1.21.0",
-    "sqlite3": "^5.1.7",
+    "sql.js": "^1.11.0",
     "uuid": "^13.0.0",
     "ws": "^8.18.3",
     "zod": "^3.25.76"

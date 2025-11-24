@@ -15,7 +15,8 @@
  */
 
 const WebSocket = require('ws');
-const sqlite3 = require('sqlite3').verbose();
+const initSqlJs = require('sql.js');
+const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const http = require('http');
 const crypto = require('crypto');
@@ -45,20 +46,45 @@ const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
 const rateLimitMap = new Map(); // ip -> { count, resetTime }
 const joinLimitMap = new Map(); // ip -> { count, resetTime }
 
-// Database setup
-const db = new sqlite3.Database(SQLITE_DB_PATH, (err) => {
-  if (err) {
-    console.error('Database connection failed:', err);
-    process.exit(1);
-  }
-  const dbType = SQLITE_DB_PATH === ':memory:' ? 'in-memory' : `file (${SQLITE_DB_PATH})`;
-  console.log(`✓ Connected to ${dbType} SQLite database`);
-});
+// Database setup (initialized in startServer)
+let db = null;
+let SQL = null;
 
-// Initialize database schema
-db.serialize(() => {
+// Save database to file periodically (for file-based persistence)
+function saveDatabase() {
+  if (db && SQLITE_DB_PATH !== ':memory:') {
+    try {
+      const data = db.export();
+      const buffer = Buffer.from(data);
+      fs.writeFileSync(SQLITE_DB_PATH, buffer);
+    } catch (err) {
+      console.error('Error saving database:', err);
+    }
+  }
+}
+
+async function initDatabase() {
+  SQL = await initSqlJs();
+
+  // Load existing database or create new one
+  if (SQLITE_DB_PATH !== ':memory:' && fs.existsSync(SQLITE_DB_PATH)) {
+    try {
+      const fileBuffer = fs.readFileSync(SQLITE_DB_PATH);
+      db = new SQL.Database(fileBuffer);
+      console.log(`✓ Loaded existing SQLite database from ${SQLITE_DB_PATH}`);
+    } catch (err) {
+      console.log(`✓ Creating new SQLite database at ${SQLITE_DB_PATH}`);
+      db = new SQL.Database();
+    }
+  } else {
+    db = new SQL.Database();
+    const dbType = SQLITE_DB_PATH === ':memory:' ? 'in-memory' : `file (${SQLITE_DB_PATH})`;
+    console.log(`✓ Created ${dbType} SQLite database`);
+  }
+
+  // Initialize database schema
   db.run(`
-    CREATE TABLE sessions (
+    CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       code TEXT UNIQUE NOT NULL,
       name TEXT NOT NULL,
@@ -69,9 +95,9 @@ db.serialize(() => {
       password_hash TEXT
     )
   `);
-  
+
   db.run(`
-    CREATE TABLE participants (
+    CREATE TABLE IF NOT EXISTS participants (
       session_id TEXT NOT NULL,
       username TEXT NOT NULL,
       joined_at INTEGER NOT NULL,
@@ -79,9 +105,9 @@ db.serialize(() => {
       FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
   `);
-  
+
   db.run(`
-    CREATE TABLE messages (
+    CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
       sender TEXT NOT NULL,
@@ -92,9 +118,9 @@ db.serialize(() => {
       FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
   `);
-  
+
   db.run(`
-    CREATE TABLE rom_syncs (
+    CREATE TABLE IF NOT EXISTS rom_syncs (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
       sender TEXT NOT NULL,
@@ -104,9 +130,9 @@ db.serialize(() => {
       FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
   `);
-  
+
   db.run(`
-    CREATE TABLE snapshots (
+    CREATE TABLE IF NOT EXISTS snapshots (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
       sender TEXT NOT NULL,
@@ -116,9 +142,9 @@ db.serialize(() => {
       FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
   `);
-  
+
   db.run(`
-    CREATE TABLE proposals (
+    CREATE TABLE IF NOT EXISTS proposals (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
       sender TEXT NOT NULL,
@@ -128,9 +154,9 @@ db.serialize(() => {
       FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
   `);
-  
+
   db.run(`
-    CREATE TABLE agent_interactions (
+    CREATE TABLE IF NOT EXISTS agent_interactions (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
       username TEXT NOT NULL,
@@ -140,9 +166,16 @@ db.serialize(() => {
       FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
   `);
-  
+
   console.log('✓ Database schema initialized');
-});
+
+  // Save database periodically for file-based persistence
+  if (SQLITE_DB_PATH !== ':memory:') {
+    setInterval(saveDatabase, 30000); // Save every 30 seconds
+  }
+
+  return db;
+}
 
 // Active WebSocket connections by session
 const sessions = new Map(); // session_code -> Set<WebSocket>
@@ -412,12 +445,22 @@ const server = http.createServer(app);
 // WebSocket server
 const wss = new WebSocket.Server({ server });
 
-server.listen(PORT, () => {
+// Start server after database initialization
+async function startServer() {
+  await initDatabase();
+
+  server.listen(PORT, () => {
     console.log(`🚀 YAZE Collaboration Server v2.0 listening on port ${PORT}`);
     console.log(`   HTTP Health Check: http://localhost:${PORT}/health`);
     console.log(`   WebSocket: ws://localhost:${PORT}`);
     console.log(`   Genkit Flow: POST http://localhost:${PORT}/yazeHello`);
     console.log(`   AI Agent: ${ENABLE_AI_AGENT ? 'Enabled' : 'Disabled'}`);
+  });
+}
+
+startServer().catch(err => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
 });
 
 wss.on('connection', (ws, req) => {
@@ -1415,38 +1458,38 @@ function removeWasmParticipant(ws) {
   ws.wasmUserId = null;
 }
 
-// Promisify database methods
+// Synchronous database methods for sql.js
 function runAsync(db, sql, params) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function(err) {
-      if (err) reject(err);
-      else resolve(this);
-    });
-  });
+  return db.run(sql, params);
 }
 
 function getAsync(db, sql, params) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  if (stmt.step()) {
+    const row = stmt.getAsObject();
+    stmt.free();
+    return row;
+  }
+  stmt.free();
+  return null;
 }
 
 function allAsync(db, sql, params) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
-  });
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject());
+  }
+  stmt.free();
+  return rows;
 }
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down server...');
-  
+
   // Notify all connected clients
   wss.clients.forEach((ws) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -1459,20 +1502,24 @@ process.on('SIGINT', async () => {
       ws.close();
     }
   });
-  
+
   // Close server
   wss.close(() => {
     server.close(() => {
-      db.close((err) => {
-        if (err) {
-          console.error('Error closing database:', err);
+      try {
+        // Save database before closing
+        saveDatabase();
+        if (db) {
+          db.close();
         }
         console.log('✓ Server shut down gracefully');
-        process.exit(0);
-      });
+      } catch (err) {
+        console.error('Error closing database:', err);
+      }
+      process.exit(0);
     });
   });
-  
+
   // Force exit after 5 seconds
   setTimeout(() => {
     console.error('⚠️  Forced shutdown after timeout');
