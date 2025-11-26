@@ -34,6 +34,7 @@ PORT=9000 ENABLE_AI_AGENT=true npm start
 - **📊 Health Monitoring** - HTTP endpoints for health checks and metrics
 - **🔒 Rate Limiting** - Per-IP rate limiting to prevent abuse
 - **📝 Structured Logging** - Detailed timestamped logging for all operations
+- **🖥️ Admin Console** - Built-in static admin UI at `/admin/ui` (uses `x-admin-key`)
 
 ### Storage
 - In-memory SQLite for fast session storage
@@ -71,6 +72,11 @@ Response:
   "startTime": 1728000000000
 }
 ```
+
+### Admin Console (UI)
+- Served at `/admin/ui` (or `/admin` redirect) when running from source.
+- Authenticate by entering your `ADMIN_API_KEY`; requests send `x-admin-key` to the existing admin endpoints.
+- Provides: health snapshot, session/room lists, user lookup, broadcast, and session/room close controls.
 
 ## 📡 WebSocket Protocol
 

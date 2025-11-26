@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YAZE Admin</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f172a;
+      --panel: #111827;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #38bdf8;
+      --danger: #ef4444;
+      --success: #22c55e;
+      --border: #1f2937;
+    }
+    body { margin: 0; font-family: "Inter", "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 24px; margin: 0 0 12px; }
+    h2 { font-size: 18px; margin: 24px 0 12px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.25); }
+    .grid { display: grid; gap: 12px; }
+    .grid.two { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+    input, textarea, select { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: #0b1221; color: var(--text); font-size: 14px; }
+    button { border: none; border-radius: 8px; padding: 10px 12px; cursor: pointer; font-weight: 600; color: #0b1221; background: var(--accent); transition: transform 0.05s ease, opacity 0.2s ease; }
+    button:hover { opacity: 0.9; }
+    button:active { transform: translateY(1px); }
+    button.secondary { background: #1f2937; color: var(--text); }
+    button.danger { background: var(--danger); color: #fff; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px; border-bottom: 1px solid var(--border); text-align: left; }
+    th { color: var(--muted); font-weight: 600; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; background: #1f2937; color: var(--muted); }
+    .pill.live { background: rgba(34, 197, 94, 0.15); color: var(--success); }
+    .pill.locked { background: rgba(56, 189, 248, 0.15); color: var(--accent); }
+    .muted { color: var(--muted); }
+    .flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .actions button { margin-right: 6px; margin-bottom: 4px; }
+    .status { font-size: 13px; color: var(--muted); }
+    .stat { background: #0b1221; border-radius: 8px; padding: 10px; border: 1px solid var(--border); }
+    .stat h3 { margin: 0 0 6px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat strong { font-size: 18px; }
+    .log { white-space: pre-wrap; background: #0b1221; border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 80px; font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace; font-size: 13px; }
+    .tag { padding: 2px 6px; border-radius: 6px; font-size: 12px; background: #0b1221; color: var(--muted); }
+    a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="flex" style="justify-content: space-between; align-items: flex-start;">
+      <div>
+        <h1>YAZE Admin Console</h1>
+        <div class="status" id="status-text">Configure connection, then Refresh.</div>
+      </div>
+      <div class="flex">
+        <button id="refresh-btn">Refresh</button>
+        <button id="clear-log" class="secondary">Clear Log</button>
+      </div>
+    </div>
+
+    <div class="grid two" style="margin-top: 14px;">
+      <div class="card">
+        <h2>Connection</h2>
+        <div class="grid">
+          <div>
+            <label for="base-url">Server URL</label>
+            <input id="base-url" placeholder="https://yaze.halext.org" />
+          </div>
+          <div>
+            <label for="admin-key">Admin API Key</label>
+            <input id="admin-key" type="password" autocomplete="off" />
+          </div>
+        </div>
+        <div class="flex" style="margin-top: 10px;">
+          <button id="save-settings">Save</button>
+          <span class="status" id="save-status"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Health</h2>
+        <div class="grid two" id="health-stats">
+          <div class="stat"><h3>Sessions</h3><strong id="stat-sessions">-</strong></div>
+          <div class="stat"><h3>WASM Rooms</h3><strong id="stat-wasm">-</strong></div>
+          <div class="stat"><h3>Connections</h3><strong id="stat-connections">-</strong></div>
+          <div class="stat"><h3>Uptime</h3><strong id="stat-uptime">-</strong></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+      <div class="flex" style="justify-content: space-between;">
+        <h2>Sessions</h2>
+        <span class="status" id="session-count">-</span>
+      </div>
+      <div class="status" style="margin-bottom: 8px;">Full protocol sessions</div>
+      <div class="table-wrap">
+        <table id="full-sessions">
+          <thead>
+            <tr>
+              <th>Code</th><th>Name</th><th>Host</th><th>Users</th><th>AI</th><th>Active</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+      <div class="flex" style="justify-content: space-between;">
+        <h2>WASM Rooms</h2>
+        <span class="status" id="wasm-count">-</span>
+      </div>
+      <div class="table-wrap">
+        <table id="wasm-rooms">
+          <thead>
+            <tr>
+              <th>Code</th><th>Name</th><th>Users</th><th>Password</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+      <h2>Details</h2>
+      <div id="detail-pane" class="log">Select a session to view details.</div>
+    </div>
+  </div>
+
+  <script>
+    const qs = (sel) => document.querySelector(sel);
+    const qsb = (sel) => [...document.querySelectorAll(sel)];
+    const state = {
+      baseUrl: localStorage.getItem('yaze_admin_base') || window.location.origin,
+      adminKey: localStorage.getItem('yaze_admin_key') || '',
+    };
+
+    const baseInput = qs('#base-url');
+    const keyInput = qs('#admin-key');
+    baseInput.value = state.baseUrl;
+    keyInput.value = state.adminKey;
+
+    const logPane = qs('#detail-pane');
+
+    function log(text) {
+      const now = new Date().toLocaleTimeString();
+      logPane.textContent = `[${now}] ${text}\n` + logPane.textContent;
+    }
+
+    function setStatus(text) {
+      qs('#status-text').textContent = text;
+    }
+
+    async function api(path, options = {}) {
+      const url = state.baseUrl.replace(/\/$/, '') + path;
+      const headers = Object.assign({ 'Content-Type': 'application/json', 'x-admin-key': state.adminKey }, options.headers || {});
+      const res = await fetch(url, { ...options, headers });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`HTTP ${res.status}: ${body}`);
+      }
+      const contentType = res.headers.get('content-type') || '';
+      return contentType.includes('application/json') ? res.json() : res.text();
+    }
+
+    function formatUptime(ms) {
+      if (!ms && ms !== 0) return '-';
+      const sec = Math.floor(ms / 1000);
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      return `${h}h ${m}m`;
+    }
+
+    async function refreshHealth() {
+      try {
+        const data = await api('/health');
+        qs('#stat-sessions').textContent = data.sessions ?? '-';
+        qs('#stat-wasm').textContent = data.wasm_rooms ?? '-';
+        qs('#stat-connections').textContent = data.total_connections ?? '-';
+        qs('#stat-uptime').textContent = formatUptime(data.uptime);
+        setStatus('Health loaded');
+      } catch (err) {
+        setStatus('Health failed');
+        log(`Health error: ${err.message}`);
+      }
+    }
+
+    function renderFullSessions(list) {
+      const tbody = qs('#full-sessions tbody');
+      tbody.innerHTML = '';
+      list.forEach((s) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><strong>${s.code}</strong></td>
+          <td>${s.name || ''}</td>
+          <td>${s.host || ''}</td>
+          <td>${s.active_connections || 0}</td>
+          <td>${s.ai_enabled ? '<span class="pill live">AI</span>' : '<span class="pill">Off</span>'}</td>
+          <td>${s.type}</td>
+          <td class="actions">
+            <button class="secondary" data-action="users" data-code="${s.code}">Users</button>
+            <button class="secondary" data-action="broadcast" data-code="${s.code}">Broadcast</button>
+            <button class="danger" data-action="close" data-code="${s.code}">Close</button>
+          </td>`;
+        tbody.appendChild(tr);
+      });
+      qs('#session-count').textContent = `${list.length} active`;
+    }
+
+    function renderWasmRooms(list) {
+      const tbody = qs('#wasm-rooms tbody');
+      tbody.innerHTML = '';
+      list.forEach((r) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><strong>${r.code}</strong></td>
+          <td>${r.name || ''}</td>
+          <td>${r.user_count || 0}</td>
+          <td>${r.password_protected ? '<span class="pill locked">Yes</span>' : '<span class="pill">No</span>'}</td>
+          <td class="actions">
+            <button class="secondary" data-action="wasm-users" data-code="${r.code}">Users</button>
+            <button class="secondary" data-action="wasm-broadcast" data-code="${r.code}">Broadcast</button>
+            <button class="danger" data-action="wasm-close" data-code="${r.code}">Close</button>
+          </td>`;
+        tbody.appendChild(tr);
+      });
+      qs('#wasm-count').textContent = `${list.length} rooms`;
+    }
+
+    async function refreshSessions() {
+      try {
+        const data = await api('/admin/sessions');
+        renderFullSessions(data.sessions || []);
+        renderWasmRooms(data.wasm_rooms || []);
+        setStatus('Sessions loaded');
+      } catch (err) {
+        setStatus('Session load failed');
+        log(`Session error: ${err.message}`);
+      }
+    }
+
+    async function showUsers(code, type) {
+      try {
+        const detail = await api(`/admin/sessions/${code}/users`);
+        logPane.textContent = JSON.stringify(detail, null, 2);
+        log(`Loaded users for ${code} (${type || detail.type || 'unknown'})`);
+      } catch (err) {
+        log(`User fetch failed for ${code}: ${err.message}`);
+      }
+    }
+
+    async function closeSession(code) {
+      const reason = prompt(`Close session ${code}? Optional reason:`, 'Closed by admin');
+      if (reason === null) return;
+      try {
+        await api(`/admin/sessions/${code}`, { method: 'DELETE', body: JSON.stringify({ reason }) });
+        log(`Closed ${code}`);
+        await refreshSessions();
+      } catch (err) {
+        log(`Close failed: ${err.message}`);
+      }
+    }
+
+    async function broadcast(code, type, pathPrefix) {
+      const message = prompt(`Broadcast to ${code}:`, 'Hello from admin');
+      if (!message) return;
+      const path = pathPrefix || '/admin/sessions';
+      try {
+        await api(`${path}/${code}/broadcast`, { method: 'POST', body: JSON.stringify({ message, message_type: 'admin' }) });
+        log(`Broadcast to ${code}`);
+      } catch (err) {
+        log(`Broadcast failed: ${err.message}`);
+      }
+    }
+
+    async function closeWasm(code) {
+      if (!confirm(`Close WASM room ${code}?`)) return;
+      try {
+        await api(`/admin/wasm/rooms/${code}`, { method: 'DELETE' });
+        log(`Closed WASM room ${code}`);
+        await refreshSessions();
+      } catch (err) {
+        log(`Close failed: ${err.message}`);
+      }
+    }
+
+    qs('#full-sessions').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn) return;
+      const code = btn.dataset.code;
+      const action = btn.dataset.action;
+      if (action === 'users') return showUsers(code, 'full');
+      if (action === 'broadcast') return broadcast(code, 'full');
+      if (action === 'close') return closeSession(code);
+    });
+
+    qs('#wasm-rooms').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn) return;
+      const code = btn.dataset.code;
+      const action = btn.dataset.action;
+      if (action === 'wasm-users') return showUsers(code, 'wasm');
+      if (action === 'wasm-broadcast') return broadcast(code, 'wasm', '/admin/wasm/rooms');
+      if (action === 'wasm-close') return closeWasm(code);
+    });
+
+    qs('#save-settings').addEventListener('click', () => {
+      state.baseUrl = baseInput.value.trim() || window.location.origin;
+      state.adminKey = keyInput.value.trim();
+      localStorage.setItem('yaze_admin_base', state.baseUrl);
+      localStorage.setItem('yaze_admin_key', state.adminKey);
+      qs('#save-status').textContent = 'Saved';
+      setTimeout(() => qs('#save-status').textContent = '', 1500);
+      setStatus('Settings saved');
+    });
+
+    qs('#refresh-btn').addEventListener('click', () => {
+      refreshHealth();
+      refreshSessions();
+    });
+
+    qs('#clear-log').addEventListener('click', () => {
+      logPane.textContent = '';
+    });
+
+    // Initial fetch on load
+    refreshHealth();
+    refreshSessions();
+  </script>
+</body>
+</html>

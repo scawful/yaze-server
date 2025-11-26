@@ -60,6 +60,8 @@ const WASM_HEARTBEAT_INTERVAL_MS = parseInt(process.env.WASM_HEARTBEAT_INTERVAL_
 const WASM_STATE_PERSIST = process.env.WASM_STATE_PERSIST === 'true';
 const WASM_STATE_DIR = process.env.WASM_STATE_DIR || path.join(__dirname, 'data', 'wasm-state');
 const WASM_MAX_STATE_EVENTS = parseInt(process.env.WASM_MAX_STATE_EVENTS, 10) || 500;
+// Admin UI path (static files)
+const ADMIN_UI_DIR = path.join(__dirname, 'admin-ui');
 
 // Rate limiting tracker
 const rateLimitMap = new Map(); // ip -> { count, resetTime }
@@ -255,6 +257,12 @@ app.use((req, res, next) => {
 
   next();
 });
+
+// Lightweight admin console (UI still requires ADMIN_API_KEY via header)
+if (fs.existsSync(ADMIN_UI_DIR)) {
+  app.use('/admin/ui', express.static(ADMIN_UI_DIR));
+  app.get('/admin', (_req, res) => res.redirect('/admin/ui/'));
+}
 
 // Genkit Configuration
 const ai = genkit({
